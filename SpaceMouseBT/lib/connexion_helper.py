@@ -67,9 +67,9 @@ def main():
             ("buttons",  ctypes.c_uint32),
         ]
 
-    kConnexionCmdHandleAxis    = 2
-    kConnexionClientModePlugin = 2
-    kConnexionMaskAll          = 0x3FFF
+    kConnexionCmdHandleAxis      = 2
+    kConnexionClientModeTakeOver = 1   # receive events regardless of which app has focus
+    kConnexionMaskAll            = 0x3FFF
 
     MsgHandler = ctypes.CFUNCTYPE(None, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p)
     DevHandler  = ctypes.CFUNCTYPE(None, ctypes.c_uint32)
@@ -91,7 +91,9 @@ def main():
     rem_cb = DevHandler(lambda pid: None)
 
     # ── 5. Register with the driver ───────────────────────────────────────
-    err = lib.SetConnexionHandlers(msg_cb, add_cb, rem_cb, False)
+    # useSeparateThread=True: framework creates its own delivery thread so
+    # we don't need to pump a run loop ourselves.
+    err = lib.SetConnexionHandlers(msg_cb, add_cb, rem_cb, True)
     sys.stderr.write(f"SetConnexionHandlers → {err}\n")
     sys.stderr.flush()
     if err != 0:
@@ -99,7 +101,7 @@ def main():
 
     app_name  = b"\x093D Slicer"   # Pascal string: 1-byte length + ASCII
     client_id = lib.RegisterConnexionClient(
-        0x534C3344, app_name, kConnexionClientModePlugin, kConnexionMaskAll,
+        0x534C3344, app_name, kConnexionClientModeTakeOver, kConnexionMaskAll,
     )
     sys.stderr.write(f"RegisterConnexionClient → client_id={client_id}\n")
     sys.stderr.flush()
@@ -111,10 +113,11 @@ def main():
     sys.stderr.write("Registered — wiggle the SpaceMouse...\n")
     sys.stderr.flush()
 
-    # ── 6. Pump CFRunLoop — delivers framework events to on_message ───────
+    # ── 6. Keep process alive; framework thread delivers to on_message ────
+    import time
     try:
         while True:
-            cf.CFRunLoopRunInMode(rl_mode, 0.05, False)
+            time.sleep(0.05)
     except KeyboardInterrupt:
         pass
     finally:
