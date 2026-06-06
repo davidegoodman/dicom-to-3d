@@ -421,7 +421,7 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
         if not os.path.isdir(fw):
             return None  # driver not installed
 
-        helper = os.path.join(os.path.dirname(__file__), "connexion_helper.py")
+        helper = os.path.join(os.path.dirname(__file__), "lib", "connexion_helper.py")
         if not os.path.isfile(helper):
             logger.warning("connexion_helper.py not found at %s", helper)
             return None
