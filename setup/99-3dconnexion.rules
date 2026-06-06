@@ -1,0 +1,27 @@
+# udev rules for 3DConnexion input devices
+# Grants read/write access to all users in the "input" group (or directly to
+# all users via MODE="0666" if you prefer not to manage group membership).
+#
+# Install:
+#   sudo cp 99-3dconnexion.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# For Bluetooth HID devices the same rules apply once the device is paired and
+# the kernel creates the /dev/hidrawN node.
+
+# ---- USB devices ----
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="256f", MODE="0660", GROUP="input"
+SUBSYSTEM=="input",  ATTRS{idVendor}=="256f", MODE="0660", GROUP="input"
+
+# ---- Bluetooth HID (matched by hidraw subsystem, no USB attrs available) ----
+# The BT device shows up as hidraw but without idVendor in the USB sense.
+# Match the parent bluetooth subsystem path and grant access.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", \
+    ATTRS{name}=="SpaceMouse*",          MODE="0660", GROUP="input"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", \
+    ATTRS{name}=="3Dconnexion*",         MODE="0660", GROUP="input"
+
+# Fallback: allow the "input" group to access ALL hidraw nodes.
+# Comment this out if you want tighter permissions.
+# KERNEL=="hidraw*", SUBSYSTEM=="hidraw", MODE="0660", GROUP="input"
