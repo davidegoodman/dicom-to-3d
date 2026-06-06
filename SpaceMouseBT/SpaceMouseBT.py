@@ -403,134 +403,82 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
 
     def _start_macos_framework(self):
         """
-        Register with the 3DConnexion driver on a **dedicated thread** that
-        owns and pumps its own CFRunLoop.
+        Launch connexion_helper.py as a subprocess.
 
-        Why a dedicated thread?  SetConnexionHandlers(useSeparateThread=False)
-        posts events to the *calling* thread's CFRunLoop.  Qt does not pump
-        CoreFoundation event sources on the main thread in a way the 3DConnexion
-        framework recognises, so callbacks never fire there.  By running the
-        handler on a thread whose CFRunLoop we control explicitly we guarantee
-        delivery.
+        The helper registers with the 3DConnexion driver and streams axis
+        events as JSON lines to stdout.  Running out-of-process gives it its
+        own Mach port — the driver's IPC mechanism requires a proper process
+        identity that it cannot find inside an embedded Python interpreter.
 
-        Returns (True, description) or None (framework not found / failed).
+        Returns (True, description) or None (framework absent / launch failed).
         """
-        import ctypes
-        import ctypes.util
+        import json
+        import os
+        import subprocess
+        import sys
 
-        fw = "/Library/Frameworks/3DconnexionClient.framework/3DconnexionClient"
-        try:
-            lib = ctypes.CDLL(fw)
-        except OSError:
-            return None  # driver not installed — fall through to pyspacemouse
+        fw = "/Library/Frameworks/3DconnexionClient.framework"
+        if not os.path.isdir(fw):
+            return None  # driver not installed
 
-        # Load CoreFoundation so we can pump the run loop ourselves.
-        try:
-            cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
-            cf.CFRunLoopRunInMode.argtypes = [
-                ctypes.c_void_p,   # CFRunLoopMode (CFStringRef)
-                ctypes.c_double,   # seconds
-                ctypes.c_uint8,    # returnAfterSourceHandled (Boolean)
-            ]
-            cf.CFRunLoopRunInMode.restype = ctypes.c_int32
-            # kCFRunLoopDefaultMode is a CFStringRef* exported by the framework.
-            # c_void_p.in_dll reads the pointer value stored at that symbol.
-            rl_mode = ctypes.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode")
-        except Exception as exc:
-            logger.warning("CoreFoundation setup failed: %s", exc)
+        helper = os.path.join(os.path.dirname(__file__), "connexion_helper.py")
+        if not os.path.isfile(helper):
+            logger.warning("connexion_helper.py not found at %s", helper)
             return None
 
-        # ConnexionDeviceState — 2-byte packing as per SDK header.
-        class ConnexionDeviceState(ctypes.Structure):
-            _pack_ = 2
-            _fields_ = [
-                ("version",  ctypes.c_uint16),
-                ("client",   ctypes.c_uint16),
-                ("command",  ctypes.c_uint16),
-                ("param",    ctypes.c_int16),
-                ("value",    ctypes.c_int32),
-                ("time",     ctypes.c_uint64),
-                ("report",   ctypes.c_uint8 * 8),
-                ("buttons8", ctypes.c_uint16),
-                ("axis",     ctypes.c_int16 * 6),  # tx,ty,tz,rx,ry,rz
-                ("address",  ctypes.c_uint16),
-                ("buttons",  ctypes.c_uint32),
-            ]
-
-        kConnexionCmdHandleAxis    = 2
-        kConnexionClientModePlugin = 2
-        kConnexionMaskAll          = 0x3FFF
-
-        MsgHandler = ctypes.CFUNCTYPE(None, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p)
-        DevHandler = ctypes.CFUNCTYPE(None, ctypes.c_uint32)
-
-        logic = self
-
-        def _on_message(connection, msg_type, msg_arg):
-            if msg_type == kConnexionCmdHandleAxis and msg_arg:
-                try:
-                    s = ctypes.cast(msg_arg, ctypes.POINTER(ConnexionDeviceState)).contents
-                    SCALE = 1.0 / 350.0
-                    with logic._lock:
-                        logic._motion[0] += s.axis[0] * SCALE
-                        logic._motion[1] += s.axis[1] * SCALE
-                        logic._motion[2] += s.axis[2] * SCALE
-                        logic._motion[3] += s.axis[3] * SCALE
-                        logic._motion[4] += s.axis[4] * SCALE
-                        logic._motion[5] += s.axis[5] * SCALE
-                        logic._cb_count += 1
-                except Exception as exc:
-                    logger.warning("SpaceMouse callback error: %s", exc)
-
-        msg_cb = MsgHandler(_on_message)
-        add_cb = DevHandler(lambda pid: None)
-        rem_cb = DevHandler(lambda pid: None)
-
-        # Keep Python objects alive for the lifetime of the connection.
-        self._cx_lib       = lib
-        self._cx_callbacks = (msg_cb, add_cb, rem_cb)
-        self._cx_client_id = None
-
-        # Must be True before the thread starts so its loop doesn't exit immediately.
-        self._running = True
-
-        def _run():
-            err = lib.SetConnexionHandlers(msg_cb, add_cb, rem_cb, False)
-            if err != 0:
-                logger.warning("SetConnexionHandlers returned %d", err)
-                return
-
-            app_name = b"\x093D Slicer"  # Pascal string: length byte + text
-            client_id = lib.RegisterConnexionClient(
-                0x534C3344,            # 'SL3D' — unique four-char app signature
-                app_name,
-                kConnexionClientModePlugin,
-                kConnexionMaskAll,
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, helper],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
-            logic._cx_client_id = client_id
-            logger.info("SpaceMouse registered, client_id=%d", client_id)
+        except Exception as exc:
+            logger.warning("Failed to launch connexion_helper: %s", exc)
+            return None
 
-            # Pump this thread's CFRunLoop in 50 ms slices.  The framework
-            # posted its event source here (useSeparateThread=False), so
-            # SpaceMouse events wake CFRunLoopRunInMode and _on_message fires.
-            while logic._running:
-                cf.CFRunLoopRunInMode(rl_mode, 0.05, False)
+        # Give the helper time to register; bail if it exits immediately.
+        time.sleep(0.3)
+        if proc.poll() is not None:
+            err = proc.stderr.read()
+            logger.warning("connexion_helper exited early: %s", err)
+            return None
 
-            lib.UnregisterConnexionClient(client_id)
-            lib.CleanupConnexionHandlers()
-            logger.info("SpaceMouse framework unregistered")
+        self._cx_proc  = proc
+        self._running  = True
+        logic          = self
 
-        self._thread = threading.Thread(target=_run, daemon=True)
+        def _read_loop():
+            SCALE = 1.0 / 350.0
+            try:
+                for line in proc.stdout:
+                    if not logic._running:
+                        break
+                    try:
+                        axis = json.loads(line)
+                        with logic._lock:
+                            for i in range(6):
+                                logic._motion[i] += axis[i] * SCALE
+                            logic._cb_count += 1
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.warning("connexion_helper read error: %s", exc)
+
+        self._thread = threading.Thread(target=_read_loop, daemon=True)
         self._thread.start()
-        time.sleep(0.15)  # let the thread register before we report "connected"
 
-        return True, "3DconnexionClient.framework + CFRunLoop thread"
+        return True, "3DconnexionClient.framework (subprocess helper)"
 
     def _cleanup_macos_framework(self):
-        # The framework thread unregisters itself when self._running → False.
-        # We just drop our Python references here.
-        self._cx_lib       = None
-        self._cx_callbacks = None
+        proc = getattr(self, "_cx_proc", None)
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+            self._cx_proc = None
 
     def _try_bt_fallback(self, forced_path):
         """
