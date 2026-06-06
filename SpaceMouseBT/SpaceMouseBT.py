@@ -403,19 +403,44 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
 
     def _start_macos_framework(self):
         """
-        Register with the 3DConnexion driver via its private framework.
-        Returns (True, description) on success, None if unavailable.
-        Works alongside the driver so Fusion 360 / Bambu Studio keep working.
+        Register with the 3DConnexion driver on a **dedicated thread** that
+        owns and pumps its own CFRunLoop.
+
+        Why a dedicated thread?  SetConnexionHandlers(useSeparateThread=False)
+        posts events to the *calling* thread's CFRunLoop.  Qt does not pump
+        CoreFoundation event sources on the main thread in a way the 3DConnexion
+        framework recognises, so callbacks never fire there.  By running the
+        handler on a thread whose CFRunLoop we control explicitly we guarantee
+        delivery.
+
+        Returns (True, description) or None (framework not found / failed).
         """
         import ctypes
+        import ctypes.util
 
         fw = "/Library/Frameworks/3DconnexionClient.framework/3DconnexionClient"
         try:
             lib = ctypes.CDLL(fw)
         except OSError:
-            return None  # Driver not installed — fall through to pyspacemouse
+            return None  # driver not installed — fall through to pyspacemouse
 
-        # ConnexionDeviceState — must match the SDK header (2-byte pack)
+        # Load CoreFoundation so we can pump the run loop ourselves.
+        try:
+            cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+            cf.CFRunLoopRunInMode.argtypes = [
+                ctypes.c_void_p,   # CFRunLoopMode (CFStringRef)
+                ctypes.c_double,   # seconds
+                ctypes.c_uint8,    # returnAfterSourceHandled (Boolean)
+            ]
+            cf.CFRunLoopRunInMode.restype = ctypes.c_int32
+            # kCFRunLoopDefaultMode is a CFStringRef* exported by the framework.
+            # c_void_p.in_dll reads the pointer value stored at that symbol.
+            rl_mode = ctypes.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode")
+        except Exception as exc:
+            logger.warning("CoreFoundation setup failed: %s", exc)
+            return None
+
+        # ConnexionDeviceState — 2-byte packing as per SDK header.
         class ConnexionDeviceState(ctypes.Structure):
             _pack_ = 2
             _fields_ = [
@@ -432,14 +457,14 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
                 ("buttons",  ctypes.c_uint32),
             ]
 
-        kConnexionCmdHandleAxis   = 2
+        kConnexionCmdHandleAxis    = 2
         kConnexionClientModePlugin = 2
         kConnexionMaskAll          = 0x3FFF
 
         MsgHandler = ctypes.CFUNCTYPE(None, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p)
         DevHandler = ctypes.CFUNCTYPE(None, ctypes.c_uint32)
 
-        logic = self  # closure capture
+        logic = self
 
         def _on_message(connection, msg_type, msg_arg):
             if msg_type == kConnexionCmdHandleAxis and msg_arg:
@@ -447,12 +472,12 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
                     s = ctypes.cast(msg_arg, ctypes.POINTER(ConnexionDeviceState)).contents
                     SCALE = 1.0 / 350.0
                     with logic._lock:
-                        logic._motion[0] += s.axis[0] * SCALE  # tx
-                        logic._motion[1] += s.axis[1] * SCALE  # ty
-                        logic._motion[2] += s.axis[2] * SCALE  # tz
-                        logic._motion[3] += s.axis[3] * SCALE  # pitch
-                        logic._motion[4] += s.axis[4] * SCALE  # roll
-                        logic._motion[5] += s.axis[5] * SCALE  # yaw
+                        logic._motion[0] += s.axis[0] * SCALE
+                        logic._motion[1] += s.axis[1] * SCALE
+                        logic._motion[2] += s.axis[2] * SCALE
+                        logic._motion[3] += s.axis[3] * SCALE
+                        logic._motion[4] += s.axis[4] * SCALE
+                        logic._motion[5] += s.axis[5] * SCALE
                         logic._cb_count += 1
                 except Exception as exc:
                     logger.warning("SpaceMouse callback error: %s", exc)
@@ -461,39 +486,49 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
         add_cb = DevHandler(lambda pid: None)
         rem_cb = DevHandler(lambda pid: None)
 
-        # False = dispatch on the calling thread's CFRunLoop (Qt drives this
-        # on macOS); True spawns a separate thread which can silently stall
-        # inside a Python/Qt process.
-        err = lib.SetConnexionHandlers(msg_cb, add_cb, rem_cb, False)
-        if err != 0:
-            logger.warning("SetConnexionHandlers returned %d", err)
-            return None
-
-        # Pascal string: first byte = length, then ASCII characters
-        app_name = b"\x093D Slicer"
-        client_id = lib.RegisterConnexionClient(
-            0x534C3344,          # four-char signature 'SL3D'
-            app_name,
-            kConnexionClientModePlugin,
-            kConnexionMaskAll,
-        )
-
-        # Hold references so Python doesn't GC the callbacks
+        # Keep Python objects alive for the lifetime of the connection.
         self._cx_lib       = lib
         self._cx_callbacks = (msg_cb, add_cb, rem_cb)
-        self._cx_client_id = client_id
+        self._cx_client_id = None
 
-        return True, "3DconnexionClient.framework (coexists with driver)"
+        # Must be True before the thread starts so its loop doesn't exit immediately.
+        self._running = True
+
+        def _run():
+            err = lib.SetConnexionHandlers(msg_cb, add_cb, rem_cb, False)
+            if err != 0:
+                logger.warning("SetConnexionHandlers returned %d", err)
+                return
+
+            app_name = b"\x093D Slicer"  # Pascal string: length byte + text
+            client_id = lib.RegisterConnexionClient(
+                0x534C3344,            # 'SL3D' — unique four-char app signature
+                app_name,
+                kConnexionClientModePlugin,
+                kConnexionMaskAll,
+            )
+            logic._cx_client_id = client_id
+            logger.info("SpaceMouse registered, client_id=%d", client_id)
+
+            # Pump this thread's CFRunLoop in 50 ms slices.  The framework
+            # posted its event source here (useSeparateThread=False), so
+            # SpaceMouse events wake CFRunLoopRunInMode and _on_message fires.
+            while logic._running:
+                cf.CFRunLoopRunInMode(rl_mode, 0.05, False)
+
+            lib.UnregisterConnexionClient(client_id)
+            lib.CleanupConnexionHandlers()
+            logger.info("SpaceMouse framework unregistered")
+
+        self._thread = threading.Thread(target=_run, daemon=True)
+        self._thread.start()
+        time.sleep(0.15)  # let the thread register before we report "connected"
+
+        return True, "3DconnexionClient.framework + CFRunLoop thread"
 
     def _cleanup_macos_framework(self):
-        lib = getattr(self, "_cx_lib", None)
-        if not lib:
-            return
-        try:
-            lib.UnregisterConnexionClient(self._cx_client_id)
-            lib.CleanupConnexionHandlers()
-        except Exception:
-            pass
+        # The framework thread unregisters itself when self._running → False.
+        # We just drop our Python references here.
         self._cx_lib       = None
         self._cx_callbacks = None
 
