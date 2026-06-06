@@ -247,6 +247,13 @@ class SpaceMouseBTWidget(ScriptedLoadableModuleWidget):
         if not self.logic.isRunning():
             return
 
+        # Show live event count so we can distinguish "no callbacks" from
+        # "callbacks fire but camera math is wrong".
+        cb = self.logic._cb_count
+        if cb != getattr(self, "_last_cb_count", -1):
+            self._statusLabel.setText(f"Status: connected — {cb} motion events")
+            self._last_cb_count = cb
+
         tx, ty, tz, pitch, roll, yaw = self.logic.drainMotion()
         if tx == ty == tz == pitch == roll == yaw == 0.0:
             return
@@ -335,7 +342,7 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
         self._lock     = threading.Lock()
         # accumulated: tx, ty, tz, pitch, roll, yaw
         self._motion   = [0.0] * 6
-        self._dev_name = ""
+        self._cb_count = 0  # total framework callbacks received
 
     # ------------------------------------------------------------------
 
@@ -446,14 +453,18 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
                         logic._motion[3] += s.axis[3] * SCALE  # pitch
                         logic._motion[4] += s.axis[4] * SCALE  # roll
                         logic._motion[5] += s.axis[5] * SCALE  # yaw
-                except Exception:
-                    pass
+                        logic._cb_count += 1
+                except Exception as exc:
+                    logger.warning("SpaceMouse callback error: %s", exc)
 
         msg_cb = MsgHandler(_on_message)
         add_cb = DevHandler(lambda pid: None)
         rem_cb = DevHandler(lambda pid: None)
 
-        err = lib.SetConnexionHandlers(msg_cb, add_cb, rem_cb, True)
+        # False = dispatch on the calling thread's CFRunLoop (Qt drives this
+        # on macOS); True spawns a separate thread which can silently stall
+        # inside a Python/Qt process.
+        err = lib.SetConnexionHandlers(msg_cb, add_cb, rem_cb, False)
         if err != 0:
             logger.warning("SetConnexionHandlers returned %d", err)
             return None
