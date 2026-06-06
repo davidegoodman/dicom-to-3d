@@ -203,13 +203,33 @@ class SpaceMouseBTWidget(ScriptedLoadableModuleWidget):
             self._statusLabel.setText(f"Status: connected — {msg}")
         else:
             self._statusLabel.setText("Status: connection failed")
+            import platform
+            if platform.system() == "Darwin":
+                checklist = (
+                    "macOS checklist:\n"
+                    "  1. System Settings → Bluetooth: confirm SpaceMouse shows 'Connected'\n"
+                    "  2. If the 3DConnexion driver is installed it blocks direct access —\n"
+                    "     uninstall it from /Library/Application Support/3Dconnexion\n"
+                    "  3. Click 'Install Python dependencies' in the module if not done\n"
+                    "  4. Restart Slicer after uninstalling the driver"
+                )
+            elif platform.system() == "Linux":
+                checklist = (
+                    "Linux checklist:\n"
+                    "  1. Pair & connect via Bluetooth (bluetoothctl)\n"
+                    "  2. Install udev rules: sudo ./setup/install.sh\n"
+                    "  3. Add yourself to the 'input' group, then log out/in\n"
+                    "  4. Try specifying /dev/hidrawN manually in the path field"
+                )
+            else:
+                checklist = (
+                    "Windows checklist:\n"
+                    "  1. Ensure SpaceMouse is paired and connected in Bluetooth settings\n"
+                    "  2. Install the 3DConnexion driver from 3dconnexion.com\n"
+                    "  3. Click 'Install Python dependencies' in the module if not done"
+                )
             slicer.util.errorDisplay(
-                f"Could not connect to SpaceMouse.\n\n{msg}\n\n"
-                "Checklist:\n"
-                "  1. Pair & connect via Bluetooth (bluetoothctl)\n"
-                "  2. Install udev rules (setup/install.sh)\n"
-                "  3. Ensure pyspacemouse is installed\n"
-                "  4. Try specifying /dev/hidrawN manually",
+                f"Could not connect to SpaceMouse.\n\n{msg}\n\n{checklist}",
                 windowTitle="SpaceMouse BT",
             )
 
