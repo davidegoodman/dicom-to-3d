@@ -344,6 +344,17 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
 
     def start(self, device_path=None):
         """Open device; return (ok: bool, message: str)."""
+        import platform
+
+        # ── macOS: prefer the 3DconnexionClient.framework so we coexist
+        #    with the official driver (required by Fusion 360, Bambu Studio…)
+        if platform.system() == "Darwin":
+            result = self._start_macos_framework()
+            if result:
+                self._running = True
+                return result  # (True, description)
+
+        # ── All platforms: pyspacemouse via direct HID (no driver needed) ──
         try:
             import pyspacemouse
         except ImportError:
@@ -354,12 +365,8 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
             )
 
         try:
-            if device_path:
-                success = pyspacemouse.open(path=device_path)
-            else:
-                success = pyspacemouse.open()
+            success = pyspacemouse.open(path=device_path) if device_path else pyspacemouse.open()
         except Exception as exc:
-            # pyspacemouse raises on failure; also try BT HID fallback
             bt_result = self._try_bt_fallback(device_path)
             if bt_result:
                 return bt_result
@@ -374,7 +381,6 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
                 "Try specifying the hidraw path manually."
             )
 
-        self._dev_name = "auto-detected"
         self._running = True
         self._thread = threading.Thread(
             target=self._poll_pyspacemouse,
@@ -382,7 +388,103 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
             daemon=True,
         )
         self._thread.start()
-        return True, f"pyspacemouse ({self._dev_name})"
+        return True, "pyspacemouse (auto-detected)"
+
+    # ------------------------------------------------------------------
+    # macOS 3DconnexionClient.framework backend
+    # ------------------------------------------------------------------
+
+    def _start_macos_framework(self):
+        """
+        Register with the 3DConnexion driver via its private framework.
+        Returns (True, description) on success, None if unavailable.
+        Works alongside the driver so Fusion 360 / Bambu Studio keep working.
+        """
+        import ctypes
+
+        fw = "/Library/Frameworks/3DconnexionClient.framework/3DconnexionClient"
+        try:
+            lib = ctypes.CDLL(fw)
+        except OSError:
+            return None  # Driver not installed — fall through to pyspacemouse
+
+        # ConnexionDeviceState — must match the SDK header (2-byte pack)
+        class ConnexionDeviceState(ctypes.Structure):
+            _pack_ = 2
+            _fields_ = [
+                ("version",  ctypes.c_uint16),
+                ("client",   ctypes.c_uint16),
+                ("command",  ctypes.c_uint16),
+                ("param",    ctypes.c_int16),
+                ("value",    ctypes.c_int32),
+                ("time",     ctypes.c_uint64),
+                ("report",   ctypes.c_uint8 * 8),
+                ("buttons8", ctypes.c_uint16),
+                ("axis",     ctypes.c_int16 * 6),  # tx,ty,tz,rx,ry,rz
+                ("address",  ctypes.c_uint16),
+                ("buttons",  ctypes.c_uint32),
+            ]
+
+        kConnexionCmdHandleAxis   = 2
+        kConnexionClientModePlugin = 2
+        kConnexionMaskAll          = 0x3FFF
+
+        MsgHandler = ctypes.CFUNCTYPE(None, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p)
+        DevHandler = ctypes.CFUNCTYPE(None, ctypes.c_uint32)
+
+        logic = self  # closure capture
+
+        def _on_message(connection, msg_type, msg_arg):
+            if msg_type == kConnexionCmdHandleAxis and msg_arg:
+                try:
+                    s = ctypes.cast(msg_arg, ctypes.POINTER(ConnexionDeviceState)).contents
+                    SCALE = 1.0 / 350.0
+                    with logic._lock:
+                        logic._motion[0] += s.axis[0] * SCALE  # tx
+                        logic._motion[1] += s.axis[1] * SCALE  # ty
+                        logic._motion[2] += s.axis[2] * SCALE  # tz
+                        logic._motion[3] += s.axis[3] * SCALE  # pitch
+                        logic._motion[4] += s.axis[4] * SCALE  # roll
+                        logic._motion[5] += s.axis[5] * SCALE  # yaw
+                except Exception:
+                    pass
+
+        msg_cb = MsgHandler(_on_message)
+        add_cb = DevHandler(lambda pid: None)
+        rem_cb = DevHandler(lambda pid: None)
+
+        err = lib.SetConnexionHandlers(msg_cb, add_cb, rem_cb, True)
+        if err != 0:
+            logger.warning("SetConnexionHandlers returned %d", err)
+            return None
+
+        # Pascal string: first byte = length, then ASCII characters
+        app_name = b"\x093D Slicer"
+        client_id = lib.RegisterConnexionClient(
+            0x534C3344,          # four-char signature 'SL3D'
+            app_name,
+            kConnexionClientModePlugin,
+            kConnexionMaskAll,
+        )
+
+        # Hold references so Python doesn't GC the callbacks
+        self._cx_lib       = lib
+        self._cx_callbacks = (msg_cb, add_cb, rem_cb)
+        self._cx_client_id = client_id
+
+        return True, "3DconnexionClient.framework (coexists with driver)"
+
+    def _cleanup_macos_framework(self):
+        lib = getattr(self, "_cx_lib", None)
+        if not lib:
+            return
+        try:
+            lib.UnregisterConnexionClient(self._cx_client_id)
+            lib.CleanupConnexionHandlers()
+        except Exception:
+            pass
+        self._cx_lib       = None
+        self._cx_callbacks = None
 
     def _try_bt_fallback(self, forced_path):
         """
@@ -438,6 +540,7 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
 
     def stop(self):
         self._running = False
+        self._cleanup_macos_framework()
         if self._thread:
             self._thread.join(timeout=2.0)
             self._thread = None
