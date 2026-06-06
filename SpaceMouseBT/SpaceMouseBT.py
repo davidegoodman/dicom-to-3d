@@ -448,7 +448,7 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
         self._running  = True
         logic          = self
 
-        def _read_loop():
+        def _read_stdout():
             SCALE = 1.0 / 350.0
             try:
                 for line in proc.stdout:
@@ -463,10 +463,21 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
                     except Exception:
                         pass
             except Exception as exc:
-                logger.warning("connexion_helper read error: %s", exc)
+                logger.warning("connexion_helper stdout error: %s", exc)
 
-        self._thread = threading.Thread(target=_read_loop, daemon=True)
+        def _read_stderr():
+            # Forward helper diagnostics to Slicer's log so they're visible
+            # in the Python console / application log.
+            try:
+                for line in proc.stderr:
+                    logger.info("[connexion_helper] %s", line.rstrip())
+            except Exception:
+                pass
+
+        self._thread        = threading.Thread(target=_read_stdout, daemon=True)
+        self._stderr_thread = threading.Thread(target=_read_stderr,  daemon=True)
         self._thread.start()
+        self._stderr_thread.start()
 
         return True, "3DconnexionClient.framework (subprocess helper)"
 
