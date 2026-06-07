@@ -208,10 +208,10 @@ class SpaceMouseBTWidget(ScriptedLoadableModuleWidget):
                 checklist = (
                     "macOS checklist:\n"
                     "  1. System Settings → Bluetooth: confirm SpaceMouse shows 'Connected'\n"
-                    "  2. If the 3DConnexion driver is installed it blocks direct access —\n"
-                    "     uninstall it from /Library/Application Support/3Dconnexion\n"
-                    "  3. Click 'Install Python dependencies' in the module if not done\n"
-                    "  4. Restart Slicer after uninstalling the driver"
+                    "  2. Ensure the 3DConnexion driver is installed (required for IPC)\n"
+                    "  3. Restart 3D Slicer after pairing the device\n"
+                    "  4. Open Help → Report a Bug → Python console and look for\n"
+                    "     'SpaceMouseBT:' log lines to confirm the framework registered"
                 )
             elif platform.system() == "Linux":
                 checklist = (
@@ -398,98 +398,163 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
         return True, "pyspacemouse (auto-detected)"
 
     # ------------------------------------------------------------------
-    # macOS 3DconnexionClient.framework backend
+    # macOS 3DconnexionClient.framework backend (in-process)
     # ------------------------------------------------------------------
 
     def _start_macos_framework(self):
         """
-        Launch connexion_helper.py as a subprocess.
+        Load 3DconnexionClient.framework directly inside Slicer's process.
 
-        The helper registers with the 3DConnexion driver and streams axis
-        events as JSON lines to stdout.  Running out-of-process gives it its
-        own Mach port — the driver's IPC mechanism requires a proper process
-        identity that it cannot find inside an embedded Python interpreter.
+        Slicer is a real macOS app with a bundle identifier, so the driver
+        delivers TakeOver-mode events to it.  useSeparateThread=True lets the
+        framework spin its own Mach-IPC thread; we never need to pump a run
+        loop manually, and Qt's event loop is left undisturbed.
 
-        Returns (True, description) or None (framework absent / launch failed).
+        Returns (True, description) or None (framework absent / init failed).
         """
-        import json
+        import ctypes
+        import ctypes.util
         import os
-        import subprocess
-        import sys
 
-        fw = "/Library/Frameworks/3DconnexionClient.framework"
-        if not os.path.isdir(fw):
-            return None  # driver not installed
-
-        helper = os.path.join(os.path.dirname(__file__), "lib", "connexion_helper.py")
-        if not os.path.isfile(helper):
-            logger.warning("connexion_helper.py not found at %s", helper)
+        fw_binary = (
+            "/Library/Frameworks/3DconnexionClient.framework/3DconnexionClient"
+        )
+        if not os.path.exists(fw_binary):
+            logger.info("SpaceMouseBT: 3DConnexion framework not installed")
             return None
 
         try:
-            proc = subprocess.Popen(
-                [sys.executable, helper],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+            lib = ctypes.CDLL(fw_binary)
+        except OSError as exc:
+            logger.warning("SpaceMouseBT: cannot load framework: %s", exc)
+            return None
+
+        # ConnexionDeviceState — must match the driver ABI exactly (_pack_=2)
+        class ConnexionDeviceState(ctypes.Structure):
+            _pack_ = 2
+            _fields_ = [
+                ("version",  ctypes.c_uint16),
+                ("client",   ctypes.c_uint16),
+                ("command",  ctypes.c_uint16),
+                ("param",    ctypes.c_int16),
+                ("value",    ctypes.c_int32),
+                ("time",     ctypes.c_uint64),
+                ("report",   ctypes.c_uint8 * 8),
+                ("buttons8", ctypes.c_uint16),
+                ("axis",     ctypes.c_int16 * 6),
+                ("address",  ctypes.c_uint16),
+                ("buttons",  ctypes.c_uint32),
+            ]
+
+        MsgHandler = ctypes.CFUNCTYPE(
+            None, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p
+        )
+        DevHandler = ctypes.CFUNCTYPE(None, ctypes.c_uint32)
+
+        SCALE = 1.0 / 350.0
+        logic = self
+
+        def on_message(connection, msg_type, msg_arg):
+            # Log unconditionally so we can see if the callback fires at all.
+            logger.debug(
+                "SpaceMouseBT: on_message connection=%d msg_type=%d",
+                connection, msg_type,
             )
-        except Exception as exc:
-            logger.warning("Failed to launch connexion_helper: %s", exc)
-            return None
-
-        # Give the helper time to register; bail if it exits immediately.
-        time.sleep(0.3)
-        if proc.poll() is not None:
-            err = proc.stderr.read()
-            logger.warning("connexion_helper exited early: %s", err)
-            return None
-
-        self._cx_proc  = proc
-        self._running  = True
-        logic          = self
-
-        def _read_stdout():
-            SCALE = 1.0 / 350.0
+            if not msg_arg:
+                return
             try:
-                for line in proc.stdout:
-                    if not logic._running:
-                        break
-                    try:
-                        axis = json.loads(line)
-                        with logic._lock:
-                            for i in range(6):
-                                logic._motion[i] += axis[i] * SCALE
-                            logic._cb_count += 1
-                    except Exception:
-                        pass
+                s = ctypes.cast(
+                    msg_arg, ctypes.POINTER(ConnexionDeviceState)
+                ).contents
+                logger.debug(
+                    "SpaceMouseBT: command=%d axis=%s",
+                    s.command, list(s.axis),
+                )
+                if any(s.axis):
+                    with logic._lock:
+                        for i in range(6):
+                            logic._motion[i] += s.axis[i] * SCALE
+                        logic._cb_count += 1
             except Exception as exc:
-                logger.warning("connexion_helper stdout error: %s", exc)
+                logger.warning("SpaceMouseBT: on_message parse error: %s", exc)
 
-        def _read_stderr():
-            # Forward helper diagnostics to Slicer's log so they're visible
-            # in the Python console / application log.
-            try:
-                for line in proc.stderr:
-                    logger.info("[connexion_helper] %s", line.rstrip())
-            except Exception:
-                pass
+        def on_device_added(device_id):
+            logger.info(
+                "SpaceMouseBT: 3DConnexion device added (id=%d)", device_id
+            )
 
-        self._thread        = threading.Thread(target=_read_stdout, daemon=True)
-        self._stderr_thread = threading.Thread(target=_read_stderr,  daemon=True)
-        self._thread.start()
-        self._stderr_thread.start()
+        def on_device_removed(device_id):
+            logger.info(
+                "SpaceMouseBT: 3DConnexion device removed (id=%d)", device_id
+            )
 
-        return True, "3DconnexionClient.framework (subprocess helper)"
+        msg_cb = MsgHandler(on_message)
+        add_cb = DevHandler(on_device_added)
+        rem_cb = DevHandler(on_device_removed)
+
+        err = lib.SetConnexionHandlers(msg_cb, add_cb, rem_cb, True)
+        logger.info("SpaceMouseBT: SetConnexionHandlers → %d", err)
+        if err != 0:
+            logger.warning(
+                "SpaceMouseBT: SetConnexionHandlers failed (%d)", err
+            )
+            return None
+
+        # Pascal string: first byte = length, then ASCII bytes
+        app_name  = b"\x093D Slicer"
+        client_id = lib.RegisterConnexionClient(
+            0x534C3344,  # 'SL3D' — unique 4-char OSType for this client
+            app_name,
+            1,           # kConnexionClientModeTakeOver
+            0x3FFF,      # kConnexionMaskAll
+        )
+        logger.info("SpaceMouseBT: RegisterConnexionClient → %d", client_id)
+        if not client_id:
+            lib.CleanupConnexionHandlers()
+            return None
+
+        try:
+            lib.SetConnexionClientMask.restype  = None
+            lib.SetConnexionClientMask.argtypes = [
+                ctypes.c_uint16, ctypes.c_uint32
+            ]
+            lib.SetConnexionClientMask(
+                ctypes.c_uint16(client_id), ctypes.c_uint32(0x3FFF)
+            )
+            logger.info("SpaceMouseBT: SetConnexionClientMask called")
+        except Exception as exc:
+            logger.warning(
+                "SpaceMouseBT: SetConnexionClientMask failed: %s", exc
+            )
+
+        # Keep every ctypes object alive — Python GC will silently break
+        # callbacks if these are collected.
+        self._fw_lib       = lib
+        self._fw_client_id = client_id
+        self._fw_msg_cb    = msg_cb
+        self._fw_add_cb    = add_cb
+        self._fw_rem_cb    = rem_cb
+
+        return True, "3DconnexionClient.framework (in-process, TakeOver)"
 
     def _cleanup_macos_framework(self):
-        proc = getattr(self, "_cx_proc", None)
-        if proc:
+        lib = getattr(self, "_fw_lib", None)
+        if lib:
+            cid = getattr(self, "_fw_client_id", None)
+            if cid:
+                try:
+                    lib.UnregisterConnexionClient(cid)
+                except Exception:
+                    pass
             try:
-                proc.terminate()
-                proc.wait(timeout=2.0)
+                lib.CleanupConnexionHandlers()
             except Exception:
                 pass
-            self._cx_proc = None
+        self._fw_lib       = None
+        self._fw_client_id = None
+        self._fw_msg_cb    = None
+        self._fw_add_cb    = None
+        self._fw_rem_cb    = None
 
     def _try_bt_fallback(self, forced_path):
         """
@@ -549,6 +614,11 @@ class SpaceMouseBTLogic(ScriptedLoadableModuleLogic):
         if self._thread:
             self._thread.join(timeout=2.0)
             self._thread = None
+        # Legacy stderr thread from old subprocess approach
+        stderr_t = getattr(self, "_stderr_thread", None)
+        if stderr_t:
+            stderr_t.join(timeout=2.0)
+            self._stderr_thread = None
         try:
             import pyspacemouse
             pyspacemouse.close()
